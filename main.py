@@ -265,7 +265,7 @@ def calc_reduction_goal(annual_tco2):
 # ──────────────────────────────────────────────
 # 9. 절감 예상 비용
 # ──────────────────────────────────────────────
-def calc_cost_saving(elec_kwh, gas_mj, reduction_goal):
+def calc_cost_saving(elec_kwh, gas_mj, reduction_goal, elec_ratio_percent, gas_ratio_percent):
     remaining_tco2 = reduction_goal["remaining_reduction_tco2"]
     current_annual_cost = round(
         (elec_kwh * ELEC_PRICE_PER_KWH + (gas_mj or 0) * GAS_PRICE_PER_MJ) * 12
@@ -279,17 +279,24 @@ def calc_cost_saving(elec_kwh, gas_mj, reduction_goal):
             "note": "이미 목표 등급을 달성한 상태"
         }
 
-    reduction_kwh_equiv = remaining_tco2 / 12 / CO2_PER_KWH
-    expected_saving_krw = round(reduction_kwh_equiv * ELEC_PRICE_PER_KWH * 12)
+    # 전기/가스 비중에 맞춰 절감량을 분배 (한쪽으로만 역산하지 않도록 수정)
+    reduction_from_elec = remaining_tco2 * (elec_ratio_percent / 100)
+    reduction_from_gas = remaining_tco2 * (gas_ratio_percent / 100)
+
+    saving_elec_krw = (reduction_from_elec / 12 / CO2_PER_KWH) * ELEC_PRICE_PER_KWH * 12 if elec_ratio_percent else 0
+    saving_gas_krw = (reduction_from_gas / 12 / CO2_PER_MJ) * GAS_PRICE_PER_MJ * 12 if gas_ratio_percent else 0
+
+    expected_saving_krw = round(saving_elec_krw + saving_gas_krw)
+    # 절감액이 현재 비용을 넘지 않도록 상한 적용
+    expected_saving_krw = min(expected_saving_krw, current_annual_cost)
     expected_annual_cost = current_annual_cost - expected_saving_krw
 
     return {
         "current_annual_cost_krw": current_annual_cost,
         "expected_annual_cost_krw": expected_annual_cost,
         "expected_saving_krw": expected_saving_krw,
-        "note": "전기 단가 기준 단순 환산 추정치 (실제 요금제에 따라 달라질 수 있음)"
+        "note": "전기/가스 단가 기준 단순 환산 추정치 (실제 요금제에 따라 달라질 수 있음)"
     }
-
 
 # ──────────────────────────────────────────────
 # 10. ESG 점수
@@ -351,7 +358,13 @@ def diagnose(elec_kwh, gas_mj=None, device_usage=None,
     s_answers = {k: v for k, v in esg_answers.items() if k.startswith("S-")}
     g_answers = {k: v for k, v in esg_answers.items() if k.startswith("G-")}
 
+    # 원인 분석 결과를 먼저 계산 (전기/가스 비중을 비용 계산에 재사용하기 위해)
+    cause_result = analyze_cause(elec_kwh, gas_mj, device_usage, industry_avg_kwh)
+    elec_ratio = cause_result["by_energy_source"]["electricity"]["ratio_percent"]
+    gas_ratio = cause_result["by_energy_source"]["gas"]["ratio_percent"]
+
     reduction_goal = calc_reduction_goal(annual_total)
+    cost_saving = calc_cost_saving(elec_kwh, gas_mj, reduction_goal, elec_ratio, gas_ratio)
 
     return {
         "energy_grade": {
@@ -360,11 +373,11 @@ def diagnose(elec_kwh, gas_mj=None, device_usage=None,
             "note": "등급 구간(A~D)은 공식 기관 기준이 아닌 자체 설정값"
         },
         "average_comparison": compare_to_average(elec_kwh, annual_total, national_avg_tco2, industry_avg_tco2),
-        "cause_analysis": analyze_cause(elec_kwh, gas_mj, device_usage, industry_avg_kwh),
+        "cause_analysis": cause_result,
         "monthly_comparison": monthly_comparison,
         "trend_prediction": predict_trend(annual_total, monthly_change_rate),
         "reduction_goal": reduction_goal,
-        "cost_saving": calc_cost_saving(elec_kwh, gas_mj, reduction_goal),
+        "cost_saving": cost_saving,
         "esg_score": {
             "E": calc_e_score(elec_kwh, gas_mj, e_answers),
             "S": calc_survey_score(s_answers),
