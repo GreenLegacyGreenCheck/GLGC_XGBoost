@@ -151,7 +151,7 @@ def health_check():
     return {"status": "ok", "service": "GreenCheck XGBoost/ESG API"}
 
 
-@app.post("/diagnose")
+@app.post("/xgboost-diagnose")
 def diagnose_endpoint(req: DiagnoseRequest):
     """원인 분석 + ESG 점수 계산"""
     result = diagnose(
