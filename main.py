@@ -9,6 +9,12 @@ GreenCheck - 탄소 배출 진단 종합 API 서버 (XGBoost/SHAP 담당 파트)
 - AI 분석 근거 자연어 문장
 - Before/After 시뮬레이션 (1도/2도/3도 감축 액션)
 
+[중요 - 공신력 명시]
+- 에너지 등급 구간은 자체 수집 데이터(서울 건물 실측)의 건물별 연간 배출량 사분위수(25, 50, 75%)를 동적으로 계산하여 적용
+- 전국/동종업 평균은 공식 통계 부재로 자체 수집 데이터(서울 건물 1,505건) 대체
+- 냉방/가스 평균 비중 30%는 공식 통계 없는 자체 가정치
+- 3개월 추세 예측은 현재 변화율 유지 단순 가정
+
 [로컬 실행]
 uvicorn main:app --reload --port 8000
 """
@@ -17,7 +23,6 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Optional, Dict
 import pandas as pd
-import math
 
 app = FastAPI(title="GreenCheck XGBoost/ESG API")
 
@@ -32,18 +37,34 @@ GAS_PRICE_PER_MJ = 20
 ASSUMED_AVG_COOLING_RATIO = 30.0
 ASSUMED_AVG_GAS_RATIO = 30.0
 
-df = pd.read_csv("real_energy_data.csv")
-AVG_ELEC_KWH = df["useQty_kwh"].mean()
-STD_ELEC_KWH = df["useQty_kwh"].std()
-
-# 사분위수 기반 에너지 등급 구간 (자체 수집 데이터 기반, 공식 근거 없음)
-# tCO2eq/년 기준으로 환산 (월간 kWh → 연간 tCO2eq)
-Q1 = round(df["useQty_kwh"].quantile(0.25) * CO2_PER_KWH * 12, 3)
-Q2 = round(df["useQty_kwh"].quantile(0.50) * CO2_PER_KWH * 12, 3)
-Q3 = round(df["useQty_kwh"].quantile(0.75) * CO2_PER_KWH * 12, 3)
+# ──────────────────────────────────────────────
+# 1. 실측 데이터 기반 동적 KPI 구간(사분위수) 계산
+# ──────────────────────────────────────────────
+try:
+    df = pd.read_csv("real_energy_data.csv")
+    AVG_ELEC_KWH = float(df["useQty_kwh"].mean())
+    STD_ELEC_KWH = float(df["useQty_kwh"].std())
+    
+    # 건물 고유 ID 기준으로 그룹화하여 월 평균을 내고 연간으로 환산 -> 정밀도 향상
+    if 'sigunguCd' in df.columns and 'bjdongCd' in df.columns and 'bun' in df.columns:
+        monthly_avg_kwh = df.groupby(['sigunguCd', 'bjdongCd', 'bun'])['useQty_kwh'].mean()
+    else:
+        monthly_avg_kwh = df["useQty_kwh"]
+        
+    annual_tco2_series = (monthly_avg_kwh * 12) * CO2_PER_KWH
+    
+    # 4자리 보존하여 등급 구간 산출
+    Q1 = round(float(annual_tco2_series.quantile(0.25)), 4)
+    Q2 = round(float(annual_tco2_series.quantile(0.50)), 4)
+    Q3 = round(float(annual_tco2_series.quantile(0.75)), 4)
+except Exception as e:
+    print(f"⚠️ 데이터 로드 실패. 기본 설정값 사용. ({e})")
+    AVG_ELEC_KWH = 0.0
+    STD_ELEC_KWH = 1.0
+    Q1, Q2, Q3 = 1.5, 2.3, 3.0
 
 GRADE_THRESHOLDS = [
-    (Q1, "A"),   # 하위 25% 미만 → 우수
+    (Q1, "A"),   # 하위 25% 이하 → 우수
     (Q2, "B"),   # 25~50% → 양호
     (Q3, "C"),   # 50~75% → 보통
 ]
@@ -83,11 +104,12 @@ def calc_energy_grade(annual_tco2):
 
 
 def calc_emission(elec_kwh, gas_mj):
+    # 가스 사용량 None 방어 및 조기 반올림으로 인한 0 반환 유실 방지(4자리 유지)
     elec_emission = elec_kwh * CO2_PER_KWH
-    gas_emission = (gas_mj or 0) * CO2_PER_MJ
+    gas_emission = float(gas_mj or 0.0) * CO2_PER_MJ
     monthly_total = elec_emission + gas_emission
-    annual_total = round(monthly_total * 12, 3)
-    return round(elec_emission, 3), round(gas_emission, 3), round(monthly_total, 3), annual_total
+    annual_total = monthly_total * 12
+    return round(elec_emission, 4), round(gas_emission, 4), round(monthly_total, 4), round(annual_total, 4)
 
 
 # ──────────────────────────────────────────────
@@ -99,7 +121,7 @@ def calc_kpi(annual_tco2):
         "annual_emission_tco2": annual_tco2,
         "energy_grade": grade,
         "grade_table": GRADE_TABLE,  # 등급 기준표 (프론트 막대 표시용)
-        "note": "등급 구간은 공식 기관 기준이 아닌 자체 설정값"
+        "note": "등급 구간은 서울 건물 자체 수집 데이터 사분위수 기준 적용"
     }
 
 
@@ -107,13 +129,17 @@ def calc_kpi(annual_tco2):
 # 2. 평균 비교
 # ──────────────────────────────────────────────
 def compare_to_average(elec_kwh, annual_tco2, national_avg_tco2=None, industry_avg_tco2=None):
-    fallback = round(AVG_ELEC_KWH * CO2_PER_KWH * 12, 3)
+    fallback = round(AVG_ELEC_KWH * CO2_PER_KWH * 12, 4)
     national_avg = national_avg_tco2 if national_avg_tco2 is not None else fallback
     industry_avg = industry_avg_tco2 if industry_avg_tco2 is not None else fallback
 
-    zscore = round((elec_kwh - AVG_ELEC_KWH) / STD_ELEC_KWH, 2)
-    percentile_below = round((df["useQty_kwh"] < elec_kwh).mean() * 100, 1)
-    rank_percentile = round(100 - percentile_below, 1)
+    zscore = round((elec_kwh - AVG_ELEC_KWH) / (STD_ELEC_KWH if STD_ELEC_KWH else 1), 2)
+    
+    try:
+        percentile_below = round((df["useQty_kwh"] < elec_kwh).mean() * 100, 1)
+        rank_percentile = round(100 - percentile_below, 1)
+    except:
+        rank_percentile = 50.0
 
     diff_vs_national = round((annual_tco2 - national_avg) / national_avg * 100, 1) if national_avg else None
     diff_vs_industry = round((annual_tco2 - industry_avg) / industry_avg * 100, 1) if industry_avg else None
@@ -155,7 +181,7 @@ def compare_to_average(elec_kwh, annual_tco2, national_avg_tco2=None, industry_a
 # ──────────────────────────────────────────────
 def analyze_cause(elec_kwh, gas_mj, device_usage, industry_avg_kwh=None):
     elec_emission = elec_kwh * CO2_PER_KWH
-    gas_emission = (gas_mj or 0) * CO2_PER_MJ
+    gas_emission = float(gas_mj or 0.0) * CO2_PER_MJ
     total_emission = elec_emission + gas_emission
 
     elec_ratio = round(elec_emission / total_emission * 100, 1) if total_emission else 0
@@ -175,15 +201,15 @@ def analyze_cause(elec_kwh, gas_mj, device_usage, industry_avg_kwh=None):
         f["rank"] = i
 
     return {
-        "total_emission_tco2": round(total_emission, 3),
+        "total_emission_tco2": round(total_emission, 4),
         "by_energy_source": {
             "electricity": {
-                "emission_tco2": round(elec_emission, 3),
+                "emission_tco2": round(elec_emission, 4),
                 "ratio_percent": elec_ratio,
                 "label": f"{round(elec_emission, 2)} tCO₂e ({elec_ratio}%)"
             },
             "gas": {
-                "emission_tco2": round(gas_emission, 3),
+                "emission_tco2": round(gas_emission, 4),
                 "ratio_percent": gas_ratio,
                 "label": f"{round(gas_emission, 2)} tCO₂e ({gas_ratio}%)"
             }
@@ -208,9 +234,10 @@ def compare_to_previous_month(elec_kwh, gas_mj, prev_elec_kwh=None, prev_gas_mj=
 
     emission_change = round((current_total - prev_total) / prev_total * 100, 1) if prev_total else None
     elec_change = round((elec_kwh - prev_elec_kwh) / prev_elec_kwh * 100, 1) if prev_elec_kwh else None
+    
     gas_change = None
-    if prev_gas_mj and gas_mj:
-        gas_change = round((gas_mj - prev_gas_mj) / prev_gas_mj * 100, 1)
+    if prev_gas_mj is not None and gas_mj is not None:
+        gas_change = round((gas_mj - prev_gas_mj) / prev_gas_mj * 100, 1) if prev_gas_mj else 0.0
 
     return {
         "electricity": {
@@ -230,24 +257,28 @@ def compare_to_previous_month(elec_kwh, gas_mj, prev_elec_kwh=None, prev_gas_mj=
 
 
 # ──────────────────────────────────────────────
-# 6. 추세 예측 (현재유지 시 3개월 후 등급 변화 포함)
+# 6. 추세 예측 (예측 배출량 기반 새로운 등급 갱신)
 # ──────────────────────────────────────────────
 def predict_trend(annual_tco2, current_grade, monthly_change_percent=None):
     if monthly_change_percent is None:
         monthly_change_percent = 0
 
     rate = monthly_change_percent / 100
-    predicted_tco2 = round(annual_tco2 * ((1 + rate) ** 3), 3)
+    predicted_tco2 = round(annual_tco2 * ((1 + rate) ** 3), 4)
+    if predicted_tco2 < 0: 
+        predicted_tco2 = 0.0
+        
+    # 변화된 배출량에 맞춰 등급 새로 판정!
     predicted_grade = calc_energy_grade(predicted_tco2)
 
     return {
         "assumption": "현재 변화율이 3개월간 동일하게 유지된다고 가정한 단순 추정치",
         "keep_current": {
             "predicted_annual_tco2": predicted_tco2,
-            "current_grade": current_grade,        # 현재 등급 (예: "B")
-            "predicted_grade": predicted_grade,    # 3개월 후 예상 등급 (예: "B")
-            "grade_change": f"{current_grade} → {predicted_grade}",  # 등급 변화 표시
-            "grade_changed": current_grade != predicted_grade         # 등급 변화 여부
+            "current_grade": current_grade,        
+            "predicted_grade": predicted_grade,    # 정상 갱신된 새로운 등급
+            "grade_change": f"{current_grade} → {predicted_grade}", 
+            "grade_changed": current_grade != predicted_grade         
         },
         "grade_table": GRADE_TABLE
     }
@@ -259,7 +290,7 @@ def predict_trend(annual_tco2, current_grade, monthly_change_percent=None):
 def calc_reduction_goal(annual_tco2):
     current_grade = calc_energy_grade(annual_tco2)
     grade_order = ["A", "B", "C", "D", "E"]
-    current_idx = grade_order.index(current_grade)
+    current_idx = grade_order.index(current_grade) if current_grade in grade_order else 3
 
     if current_idx == 0:
         target_tco2 = annual_tco2
@@ -268,7 +299,7 @@ def calc_reduction_goal(annual_tco2):
         target_grade = grade_order[current_idx - 1]
         target_tco2 = GRADE_THRESHOLDS[current_idx - 1][0]
 
-    remaining = round(annual_tco2 - target_tco2, 3)
+    remaining = round(annual_tco2 - target_tco2, 4)
     progress = round((1 - remaining / annual_tco2) * 100, 1) if annual_tco2 else 0
     progress = max(0, min(100, progress))
 
@@ -289,7 +320,7 @@ def calc_reduction_goal(annual_tco2):
 def calc_cost_saving(elec_kwh, gas_mj, reduction_goal, elec_ratio_percent, gas_ratio_percent):
     remaining_tco2 = reduction_goal["remaining_reduction_tco2"]
     current_annual_cost = round(
-        (elec_kwh * ELEC_PRICE_PER_KWH + (gas_mj or 0) * GAS_PRICE_PER_MJ) * 12
+        (elec_kwh * ELEC_PRICE_PER_KWH + float(gas_mj or 0.0) * GAS_PRICE_PER_MJ) * 12
     )
 
     if remaining_tco2 <= 0:
@@ -334,6 +365,8 @@ def calc_survey_score(answers):
 
 
 def stage_score(value, mean, std):
+    if std == 0:
+        std = 1.0
     z = (value - mean) / std
     if z < -0.1:
         return 100
@@ -348,11 +381,11 @@ def calc_esg_score(elec_kwh, gas_mj, esg_answers):
     g_answers = {k: v for k, v in esg_answers.items() if k.startswith("G-")}
 
     emission_score = stage_score(
-        elec_kwh * CO2_PER_KWH + (gas_mj or 0) * CO2_PER_MJ,
+        elec_kwh * CO2_PER_KWH + float(gas_mj or 0.0) * CO2_PER_MJ,
         AVG_ELEC_KWH * CO2_PER_KWH, STD_ELEC_KWH * CO2_PER_KWH
     )
     energy_score = stage_score(
-        elec_kwh * MJ_PER_KWH + (gas_mj or 0),
+        elec_kwh * MJ_PER_KWH + float(gas_mj or 0.0),
         AVG_ELEC_KWH * MJ_PER_KWH, STD_ELEC_KWH * MJ_PER_KWH
     )
     e_survey = calc_survey_score(e_answers)
