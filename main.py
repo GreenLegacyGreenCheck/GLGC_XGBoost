@@ -124,7 +124,7 @@ def compare_to_average(elec_kwh, annual_tco2, national_avg_tco2=None, industry_a
     diff_vs_industry = round((annual_tco2 - industry_avg) / industry_avg * 100, 1) if industry_avg else None
 
     # 진단 메시지 (규칙 기반)
-   if rank_percentile <= 30:
+    if rank_percentile <= 30:
         message = f"동종업 상위 {rank_percentile}%에 해당해요. 현재 수준을 잘 유지해보세요."
     elif rank_percentile <= 60:
         message = f"동종업 상위 {rank_percentile}%에 해당해요. 조금 더 노력하면 상위권 진입이 가능해요."
