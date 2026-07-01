@@ -166,23 +166,13 @@ def analyze_cause(elec_kwh, gas_mj, device_usage, industry_avg_kwh=None):
     elec_ratio = round(elec_emission / total_emission * 100, 1) if total_emission else 0
     gas_ratio = round(gas_emission / total_emission * 100, 1) if total_emission else 0
 
-    device_usage = device_usage or {}
-    cooling = device_usage.get("cooling", 0)
-    lighting_etc = sum(v for k, v in device_usage.items() if k != "cooling")
-    total_device = cooling + lighting_etc
-
-    cooling_ratio = round(cooling / total_device * 100, 1) if total_device else 0
-    lighting_etc_ratio = round(lighting_etc / total_device * 100, 1) if total_device else 0
-
     base_avg = industry_avg_kwh if industry_avg_kwh else AVG_ELEC_KWH
     elec_vs_avg = round((elec_kwh - base_avg) / base_avg * 100, 1) if base_avg else 0
-    cooling_vs_avg = round(cooling_ratio - ASSUMED_AVG_COOLING_RATIO, 1)
     gas_vs_avg = round(gas_ratio - ASSUMED_AVG_GAS_RATIO, 1)
 
-    # 순위별 기여 요인
+    # 순위 (전기/가스만, 냉방기 제거)
     factors = [
         {"factor": "전기 사용량", "value_percent": elec_vs_avg},
-        {"factor": "냉방기 사용", "value_percent": cooling_vs_avg},
         {"factor": "가스 사용량", "value_percent": gas_vs_avg}
     ]
     ranked = sorted(factors, key=lambda x: abs(x["value_percent"]), reverse=True)
@@ -205,13 +195,11 @@ def analyze_cause(elec_kwh, gas_mj, device_usage, industry_avg_kwh=None):
         },
         "comparison_metrics": {
             "elec_vs_avg_percent": elec_vs_avg,
-            "cooling_vs_avg_percent": cooling_vs_avg,
             "gas_vs_avg_percent": gas_vs_avg,
-            "note": "냉방/가스 평균 비중 30%는 공식 통계 부재로 인한 자체 가정치"
+            "note": "가스 평균 비중 30%는 공식 통계 부재로 인한 자체 가정치"
         },
         "ranked_factors": ranked
     }
-
 
 # ──────────────────────────────────────────────
 # 5. 전월 대비 비교
