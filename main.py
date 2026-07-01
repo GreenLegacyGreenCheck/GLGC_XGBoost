@@ -2,31 +2,18 @@
 GreenCheck - 탄소 배출 진단 종합 API 서버 (XGBoost/SHAP 담당 파트)
 
 [역할]
-탄소배출 진단 보고서에 필요한 숫자 데이터를 계산해서 반환.
-1. 핵심 KPI - 연간 탄소배출량, 에너지 등급(A~D)
-2. 평균 비교 - 전국 평균 / 동종업 평균 / 우리 가게, z-score, 업종 내 백분위
-3. 에너지원별 배출량 - 전기/가스 비중
-4. 원인 분석 - 전기>냉방/조명 비중, 순위별 기여 요인 (수치만)
-5. 전월 비교 - 전기 사용량/탄소배출량 증감
-6. 추세 예측 - 3개월 후 현재유지 시 수치
-8. 절감 목표/진행률
-9. 절감 비용
-10. ESG 자가진단 점수 (E/S/G)
+탄소배출 진단 보고서 화면에 필요한 모든 숫자 데이터를 계산해서 반환.
 
-[제외 항목 - LLM/RAG 담당으로 합의됨]
-- AI 종합 의견 요약 문장
-- "AI 분석 근거" 자연어 문장 (예: "전기 사용량이 동종업 평균보다 27% 높음")
-- 개선 후 모습(Before/After, 온도별 시뮬레이션), 추천 액션 적용 시나리오
-본 모듈은 위 항목들의 재료가 되는 숫자만 제공하며, 문장 생성 및
-액션 시뮬레이션은 LLM/RAG 파트에서 처리함.
+[제외 항목 - LLM/RAG 담당]
+- AI 종합 의견 텍스트
+- AI 분석 근거 자연어 문장
+- Before/After 시뮬레이션 (1도/2도/3도 감축 액션)
 
 [중요 - 공신력 명시]
-- 에너지 등급 구간(A:0~1.5, B:1.5~2.3, C:2.3~3, D:3~4 tCO2eq/년)은
-  공식 기관 기준이 아니라 팀 자체 설정값.
-- "전국 평균"과 "동종업 평균"은 공식 통계 부재로 기본적으로 동일한
-  자체 수집 데이터(real_energy_data.csv, 서울 건물 1,505건) 평균을 사용함.
-  백엔드가 national_avg_tco2, industry_avg_tco2를 별도로 주면 그 값을 우선 사용.
-- 3개월 추세 예측은 시계열 모델이 아닌 "현재 변화율 유지" 단순 가정.
+- 에너지 등급 구간(A:0~1.5, B:1.5~2.3, C:2.3~3, D:3~4 tCO2eq/년)은 팀 자체 설정값
+- 전국/동종업 평균은 공식 통계 부재로 자체 수집 데이터(서울 건물 1,505건) 대체
+- 냉방/가스 평균 비중 30%는 공식 통계 없는 자체 가정치
+- 3개월 추세 예측은 현재 변화율 유지 단순 가정
 
 [로컬 실행]
 uvicorn main:app --reload --port 8000
@@ -40,25 +27,34 @@ import pandas as pd
 app = FastAPI(title="GreenCheck XGBoost/ESG API")
 
 # ──────────────────────────────────────────────
-# 상수 및 기준값
+# 상수
 # ──────────────────────────────────────────────
-
 CO2_PER_KWH = 0.4541 / 1000
 CO2_PER_MJ = 0.002176
 MJ_PER_KWH = 3.6
 ELEC_PRICE_PER_KWH = 150
 GAS_PRICE_PER_MJ = 20
+ASSUMED_AVG_COOLING_RATIO = 30.0
+ASSUMED_AVG_GAS_RATIO = 30.0
 
 df = pd.read_csv("real_energy_data.csv")
 AVG_ELEC_KWH = df["useQty_kwh"].mean()
 STD_ELEC_KWH = df["useQty_kwh"].std()
 
-# 에너지 등급 구간 (자체 설정, 공식 근거 없음 - 연간 tCO2eq 기준)
+# 에너지 등급 구간 (자체 설정, 공식 근거 없음)
 GRADE_THRESHOLDS = [
     (1.5, "A"),
     (2.3, "B"),
     (3.0, "C"),
     (4.0, "D")
+]
+
+# 등급 기준표 (프론트 기준표 표시용)
+GRADE_TABLE = [
+    {"grade": "D", "range": "3~4", "min": 3.0, "max": 4.0},
+    {"grade": "C", "range": "2.3~3", "min": 2.3, "max": 3.0},
+    {"grade": "B", "range": "1.5~2.3", "min": 1.5, "max": 2.3},
+    {"grade": "A", "range": "0~1.5", "min": 0.0, "max": 1.5}
 ]
 
 ESG_QUESTIONS = {
@@ -78,8 +74,15 @@ ESG_QUESTIONS = {
 
 
 # ──────────────────────────────────────────────
-# 1. 배출량 계산
+# 공통 함수
 # ──────────────────────────────────────────────
+def calc_energy_grade(annual_tco2):
+    for threshold, grade in GRADE_THRESHOLDS:
+        if annual_tco2 <= threshold:
+            return grade
+    return "E"
+
+
 def calc_emission(elec_kwh, gas_mj):
     elec_emission = elec_kwh * CO2_PER_KWH
     gas_emission = (gas_mj or 0) * CO2_PER_MJ
@@ -88,21 +91,26 @@ def calc_emission(elec_kwh, gas_mj):
     return round(elec_emission, 3), round(gas_emission, 3), round(monthly_total, 3), annual_total
 
 
-def calc_energy_grade(annual_tco2):
-    for threshold, grade in GRADE_THRESHOLDS:
-        if annual_tco2 <= threshold:
-            return grade
-    return "E"
+# ──────────────────────────────────────────────
+# 1. 핵심 KPI (연간 배출량 + 에너지 등급)
+# ──────────────────────────────────────────────
+def calc_kpi(annual_tco2):
+    grade = calc_energy_grade(annual_tco2)
+    return {
+        "annual_emission_tco2": annual_tco2,
+        "energy_grade": grade,
+        "grade_table": GRADE_TABLE,  # 등급 기준표 (프론트 막대 표시용)
+        "note": "등급 구간은 공식 기관 기준이 아닌 자체 설정값"
+    }
 
 
 # ──────────────────────────────────────────────
-# 2. 평균 비교 (전국 평균 / 동종업 평균 / 우리 가게)
+# 2. 평균 비교
 # ──────────────────────────────────────────────
 def compare_to_average(elec_kwh, annual_tco2, national_avg_tco2=None, industry_avg_tco2=None):
-    fallback_avg_tco2 = round(AVG_ELEC_KWH * CO2_PER_KWH * 12, 3)
-
-    national_avg = national_avg_tco2 if national_avg_tco2 is not None else fallback_avg_tco2
-    industry_avg = industry_avg_tco2 if industry_avg_tco2 is not None else fallback_avg_tco2
+    fallback = round(AVG_ELEC_KWH * CO2_PER_KWH * 12, 3)
+    national_avg = national_avg_tco2 if national_avg_tco2 is not None else fallback
+    industry_avg = industry_avg_tco2 if industry_avg_tco2 is not None else fallback
 
     zscore = round((elec_kwh - AVG_ELEC_KWH) / STD_ELEC_KWH, 2)
     percentile_below = round((df["useQty_kwh"] < elec_kwh).mean() * 100, 1)
@@ -110,6 +118,23 @@ def compare_to_average(elec_kwh, annual_tco2, national_avg_tco2=None, industry_a
 
     diff_vs_national = round((annual_tco2 - national_avg) / national_avg * 100, 1) if national_avg else None
     diff_vs_industry = round((annual_tco2 - industry_avg) / industry_avg * 100, 1) if industry_avg else None
+
+    # 진단 메시지 (규칙 기반)
+    if rank_percentile >= 70:
+        message = f"동종업 상위 {rank_percentile}%에 해당해요. 현재 수준을 잘 유지해보세요."
+    elif rank_percentile >= 40:
+        message = f"동종업 상위 {rank_percentile}%에 해당해요. 조금만 더 노력하면 상위권 진입이 가능해요."
+    else:
+        message = f"동종업 상위 {rank_percentile}%에 해당해요. 감축 액션이 필요해요."
+
+    # 평균 대비 라벨
+    if diff_vs_industry is not None:
+        if diff_vs_industry < 0:
+            avg_label = f"전국 소상공인 평균 대비 {abs(diff_vs_industry)}% 낮음"
+        else:
+            avg_label = f"전국 소상공인 평균 대비 {diff_vs_industry}% 높음"
+    else:
+        avg_label = None
 
     return {
         "national_avg_tco2": national_avg,
@@ -119,13 +144,15 @@ def compare_to_average(elec_kwh, annual_tco2, national_avg_tco2=None, industry_a
         "is_official_industry_avg": industry_avg_tco2 is not None,
         "diff_vs_national_percent": diff_vs_national,
         "diff_vs_industry_percent": diff_vs_industry,
+        "avg_comparison_label": avg_label,
         "zscore": zscore,
-        "rank_percentile": rank_percentile
+        "rank_percentile": rank_percentile,
+        "diagnosis_message": message
     }
 
 
 # ──────────────────────────────────────────────
-# 3+4. 에너지원별 배출량 + 원인 분석 (수치만, 문장 생성은 LLM 담당)
+# 3+4. 에너지원별 배출량 + 원인 분석
 # ──────────────────────────────────────────────
 def analyze_cause(elec_kwh, gas_mj, device_usage, industry_avg_kwh=None):
     elec_emission = elec_kwh * CO2_PER_KWH
@@ -144,16 +171,13 @@ def analyze_cause(elec_kwh, gas_mj, device_usage, industry_avg_kwh=None):
     lighting_etc_ratio = round(lighting_etc / total_device * 100, 1) if total_device else 0
 
     base_avg = industry_avg_kwh if industry_avg_kwh else AVG_ELEC_KWH
-    elec_vs_avg_percent = round((elec_kwh - base_avg) / base_avg * 100, 1) if base_avg else 0
-
-    # 냉방 비중 비교 기준값 (공식 통계 없음, 자체 가정치 - LLM이 문장화할 때 참고)
-    ASSUMED_AVG_COOLING_RATIO = 30.0
+    elec_vs_avg = round((elec_kwh - base_avg) / base_avg * 100, 1) if base_avg else 0
     cooling_vs_avg = round(cooling_ratio - ASSUMED_AVG_COOLING_RATIO, 1)
-    gas_vs_avg = round(gas_ratio - 30.0, 1)  # 가스 평균 비중도 30% 가정
+    gas_vs_avg = round(gas_ratio - ASSUMED_AVG_GAS_RATIO, 1)
 
-    # 순위별 기여 요인 (수치만 제공, 근거 문장은 LLM이 생성)
+    # 순위별 기여 요인
     factors = [
-        {"factor": "전기 사용량", "value_percent": elec_vs_avg_percent},
+        {"factor": "전기 사용량", "value_percent": elec_vs_avg},
         {"factor": "냉방기 사용", "value_percent": cooling_vs_avg},
         {"factor": "가스 사용량", "value_percent": gas_vs_avg}
     ]
@@ -164,15 +188,23 @@ def analyze_cause(elec_kwh, gas_mj, device_usage, industry_avg_kwh=None):
     return {
         "total_emission_tco2": round(total_emission, 3),
         "by_energy_source": {
-            "electricity": {"emission_tco2": round(elec_emission, 3), "ratio_percent": elec_ratio},
-            "gas": {"emission_tco2": round(gas_emission, 3), "ratio_percent": gas_ratio}
+            "electricity": {
+                "emission_tco2": round(elec_emission, 3),
+                "ratio_percent": elec_ratio,
+                "label": f"{round(elec_emission, 2)} tCO₂e ({elec_ratio}%)"
+            },
+            "gas": {
+                "emission_tco2": round(gas_emission, 3),
+                "ratio_percent": gas_ratio,
+                "label": f"{round(gas_emission, 2)} tCO₂e ({gas_ratio}%)"
+            }
         },
         "electricity_breakdown": {
             "cooling_ratio_percent": cooling_ratio,
             "lighting_etc_ratio_percent": lighting_etc_ratio
         },
         "comparison_metrics": {
-            "elec_vs_avg_percent": elec_vs_avg_percent,
+            "elec_vs_avg_percent": elec_vs_avg,
             "cooling_vs_avg_percent": cooling_vs_avg,
             "gas_vs_avg_percent": gas_vs_avg,
             "note": "냉방/가스 평균 비중 30%는 공식 통계 부재로 인한 자체 가정치"
@@ -201,34 +233,40 @@ def compare_to_previous_month(elec_kwh, gas_mj, prev_elec_kwh=None, prev_gas_mj=
         "electricity": {
             "previous_kwh": prev_elec_kwh,
             "current_kwh": elec_kwh,
-            "change_percent": elec_change
+            "change_percent": elec_change,
+            "direction": "증가" if (elec_change or 0) > 0 else "감소"
         },
         "carbon_emission": {
             "previous_tco2": prev_total,
             "current_tco2": current_total,
-            "change_percent": emission_change
+            "change_percent": emission_change,
+            "direction": "증가" if (emission_change or 0) > 0 else "감소"
         },
         "gas_usage_change_percent": gas_change
     }
 
 
 # ──────────────────────────────────────────────
-# 6. 3개월 후 추세 예측 (현재유지 시나리오 수치만, 추천액션 시나리오는 RAG 담당)
+# 6. 추세 예측 (현재유지 시 3개월 후 등급 변화 포함)
 # ──────────────────────────────────────────────
-def predict_trend(annual_tco2, monthly_change_percent=None):
+def predict_trend(annual_tco2, current_grade, monthly_change_percent=None):
     if monthly_change_percent is None:
         monthly_change_percent = 0
 
     rate = monthly_change_percent / 100
-    predicted_keep = round(annual_tco2 * ((1 + rate) ** 3), 3)
-    predicted_grade_keep = calc_energy_grade(predicted_keep)
+    predicted_tco2 = round(annual_tco2 * ((1 + rate) ** 3), 3)
+    predicted_grade = calc_energy_grade(predicted_tco2)
 
     return {
         "assumption": "현재 변화율이 3개월간 동일하게 유지된다고 가정한 단순 추정치",
         "keep_current": {
-            "predicted_annual_tco2": predicted_keep,
-            "predicted_grade": predicted_grade_keep
-        }
+            "predicted_annual_tco2": predicted_tco2,
+            "current_grade": current_grade,        # 현재 등급 (예: "B")
+            "predicted_grade": predicted_grade,    # 3개월 후 예상 등급 (예: "B")
+            "grade_change": f"{current_grade} → {predicted_grade}",  # 등급 변화 표시
+            "grade_changed": current_grade != predicted_grade         # 등급 변화 여부
+        },
+        "grade_table": GRADE_TABLE
     }
 
 
@@ -276,27 +314,31 @@ def calc_cost_saving(elec_kwh, gas_mj, reduction_goal, elec_ratio_percent, gas_r
             "current_annual_cost_krw": current_annual_cost,
             "expected_annual_cost_krw": current_annual_cost,
             "expected_saving_krw": 0,
+            "annual_saving_label": "이미 목표 등급 달성",
             "note": "이미 목표 등급을 달성한 상태"
         }
 
-    # 전기/가스 비중에 맞춰 절감량을 분배 (한쪽으로만 역산하지 않도록 수정)
     reduction_from_elec = remaining_tco2 * (elec_ratio_percent / 100)
     reduction_from_gas = remaining_tco2 * (gas_ratio_percent / 100)
 
-    saving_elec_krw = (reduction_from_elec / 12 / CO2_PER_KWH) * ELEC_PRICE_PER_KWH * 12 if elec_ratio_percent else 0
-    saving_gas_krw = (reduction_from_gas / 12 / CO2_PER_MJ) * GAS_PRICE_PER_MJ * 12 if gas_ratio_percent else 0
+    saving_elec = (reduction_from_elec / 12 / CO2_PER_KWH) * ELEC_PRICE_PER_KWH * 12 if elec_ratio_percent else 0
+    saving_gas = (reduction_from_gas / 12 / CO2_PER_MJ) * GAS_PRICE_PER_MJ * 12 if gas_ratio_percent else 0
 
-    expected_saving_krw = round(saving_elec_krw + saving_gas_krw)
-    # 절감액이 현재 비용을 넘지 않도록 상한 적용
-    expected_saving_krw = min(expected_saving_krw, current_annual_cost)
+    expected_saving_krw = min(round(saving_elec + saving_gas), current_annual_cost)
     expected_annual_cost = current_annual_cost - expected_saving_krw
+
+    # "연간 약 N만원 절감" 라벨
+    saving_manwon = round(expected_saving_krw / 10000)
+    annual_saving_label = f"연간 약 {saving_manwon}만원 절감"
 
     return {
         "current_annual_cost_krw": current_annual_cost,
         "expected_annual_cost_krw": expected_annual_cost,
         "expected_saving_krw": expected_saving_krw,
+        "annual_saving_label": annual_saving_label,
         "note": "전기/가스 단가 기준 단순 환산 추정치 (실제 요금제에 따라 달라질 수 있음)"
     }
+
 
 # ──────────────────────────────────────────────
 # 10. ESG 점수
@@ -309,35 +351,56 @@ def calc_survey_score(answers):
 
 
 def stage_score(value, mean, std):
-    zscore = (value - mean) / std
-    if zscore < -0.1:
+    z = (value - mean) / std
+    if z < -0.1:
         return 100
-    elif zscore <= 0.1:
+    elif z <= 0.1:
         return 50
     return 0
 
 
-def calc_e_score(elec_kwh, gas_mj, e_answers):
+def calc_esg_score(elec_kwh, gas_mj, esg_answers):
+    e_answers = {k: v for k, v in esg_answers.items() if k.startswith("E-")}
+    s_answers = {k: v for k, v in esg_answers.items() if k.startswith("S-")}
+    g_answers = {k: v for k, v in esg_answers.items() if k.startswith("G-")}
+
     emission_score = stage_score(
         elec_kwh * CO2_PER_KWH + (gas_mj or 0) * CO2_PER_MJ,
-        AVG_ELEC_KWH * CO2_PER_KWH,
-        STD_ELEC_KWH * CO2_PER_KWH
+        AVG_ELEC_KWH * CO2_PER_KWH, STD_ELEC_KWH * CO2_PER_KWH
     )
     energy_score = stage_score(
         elec_kwh * MJ_PER_KWH + (gas_mj or 0),
-        AVG_ELEC_KWH * MJ_PER_KWH,
-        STD_ELEC_KWH * MJ_PER_KWH
+        AVG_ELEC_KWH * MJ_PER_KWH, STD_ELEC_KWH * MJ_PER_KWH
     )
-    survey_score = calc_survey_score(e_answers)
+    e_survey = calc_survey_score(e_answers)
+    e_scores = [s for s in [emission_score, energy_score, e_survey] if s is not None]
+    e_final = round(sum(e_scores) / len(e_scores), 1) if e_scores else None
 
-    scores = [s for s in [emission_score, energy_score, survey_score] if s is not None]
-    final_score = round(sum(scores) / len(scores), 1) if scores else None
+    s_score = calc_survey_score(s_answers)
+    g_score = calc_survey_score(g_answers)
+
+    # 종합 상태 라벨
+    scores = [s for s in [e_final, s_score, g_score] if s is not None]
+    avg_total = sum(scores) / len(scores) if scores else 0
+    if avg_total >= 80:
+        status_label = "우수"
+    elif avg_total >= 60:
+        status_label = "양호"
+    elif avg_total >= 40:
+        status_label = "보통"
+    else:
+        status_label = "개선 필요"
 
     return {
-        "emission_score": emission_score,
-        "energy_score": energy_score,
-        "survey_score": survey_score,
-        "final_score": final_score
+        "E": {
+            "emission_score": emission_score,
+            "energy_score": energy_score,
+            "survey_score": e_survey,
+            "final_score": e_final
+        },
+        "S": s_score,
+        "G": g_score,
+        "status_label": status_label
     }
 
 
@@ -348,17 +411,14 @@ def diagnose(elec_kwh, gas_mj=None, device_usage=None,
              national_avg_tco2=None, industry_avg_tco2=None, industry_avg_kwh=None,
              esg_answers=None, prev_elec_kwh=None, prev_gas_mj=None):
 
-    elec_emission, gas_emission, monthly_total, annual_total = calc_emission(elec_kwh, gas_mj)
+    _, _, monthly_total, annual_total = calc_emission(elec_kwh, gas_mj)
+
+    kpi = calc_kpi(annual_total)
+    current_grade = kpi["energy_grade"]
 
     monthly_comparison = compare_to_previous_month(elec_kwh, gas_mj, prev_elec_kwh, prev_gas_mj)
     monthly_change_rate = monthly_comparison["carbon_emission"]["change_percent"] if monthly_comparison else None
 
-    esg_answers = esg_answers or {}
-    e_answers = {k: v for k, v in esg_answers.items() if k.startswith("E-")}
-    s_answers = {k: v for k, v in esg_answers.items() if k.startswith("S-")}
-    g_answers = {k: v for k, v in esg_answers.items() if k.startswith("G-")}
-
-    # 원인 분석 결과를 먼저 계산 (전기/가스 비중을 비용 계산에 재사용하기 위해)
     cause_result = analyze_cause(elec_kwh, gas_mj, device_usage, industry_avg_kwh)
     elec_ratio = cause_result["by_energy_source"]["electricity"]["ratio_percent"]
     gas_ratio = cause_result["by_energy_source"]["gas"]["ratio_percent"]
@@ -367,22 +427,14 @@ def diagnose(elec_kwh, gas_mj=None, device_usage=None,
     cost_saving = calc_cost_saving(elec_kwh, gas_mj, reduction_goal, elec_ratio, gas_ratio)
 
     return {
-        "energy_grade": {
-            "grade": calc_energy_grade(annual_total),
-            "annual_emission_tco2": annual_total,
-            "note": "등급 구간(A~D)은 공식 기관 기준이 아닌 자체 설정값"
-        },
+        "kpi": kpi,
         "average_comparison": compare_to_average(elec_kwh, annual_total, national_avg_tco2, industry_avg_tco2),
         "cause_analysis": cause_result,
         "monthly_comparison": monthly_comparison,
-        "trend_prediction": predict_trend(annual_total, monthly_change_rate),
+        "trend_prediction": predict_trend(annual_total, current_grade, monthly_change_rate),
         "reduction_goal": reduction_goal,
         "cost_saving": cost_saving,
-        "esg_score": {
-            "E": calc_e_score(elec_kwh, gas_mj, e_answers),
-            "S": calc_survey_score(s_answers),
-            "G": calc_survey_score(g_answers)
-        }
+        "esg_score": calc_esg_score(elec_kwh, gas_mj, esg_answers or {})
     }
 
 
@@ -409,8 +461,8 @@ def health_check():
 
 @app.post("/xgboost-diagnose")
 def diagnose_endpoint(req: DiagnoseRequest):
-    """탄소배출 진단 데이터 계산 (자연어 문장, Before/After 시뮬레이션은 LLM/RAG 담당)"""
-    result = diagnose(
+    """탄소배출 진단 보고서 전체 항목 계산 (AI 문장/Before-After 시뮬레이션은 LLM/RAG 담당)"""
+    return diagnose(
         elec_kwh=req.elec_kwh,
         gas_mj=req.gas_mj,
         device_usage=req.device_usage,
@@ -421,7 +473,6 @@ def diagnose_endpoint(req: DiagnoseRequest):
         prev_elec_kwh=req.prev_elec_kwh,
         prev_gas_mj=req.prev_gas_mj
     )
-    return result
 
 
 @app.get("/esg-questions")
