@@ -40,27 +40,31 @@ ASSUMED_AVG_GAS_RATIO = 30.0
 # ──────────────────────────────────────────────
 # 1. 실측 데이터 기반 동적 KPI 구간(사분위수) 계산
 # ──────────────────────────────────────────────
-def initialize_kpi_thresholds():
+AVG_ELEC_KWH = 100.0
+STD_ELEC_KWH = 50.0
+Q1, Q2, Q3 = 1.5, 2.3, 3.0
+
+def initialize_data():
+    global AVG_ELEC_KWH, STD_ELEC_KWH, Q1, Q2, Q3
     try:
         df = pd.read_csv("real_energy_data.csv")
-        # 건물별 그룹화 후 연간 환산
+        # 평균 및 표준편차 계산
+        AVG_ELEC_KWH = float(df["useQty_kwh"].mean())
+        STD_ELEC_KWH = float(df["useQty_kwh"].std())
+        
+        # 사분위수 계산
         annual_tco2 = (df.groupby(['sigunguCd', 'bjdongCd', 'bun'])['useQty_kwh'].mean() * 12) * CO2_PER_KWH
-        q1 = float(annual_tco2.quantile(0.25))
-        q2 = float(annual_tco2.quantile(0.50))
-        q3 = float(annual_tco2.quantile(0.75))
-        return q1, q2, q3
-    except:
-        return 1.5, 2.3, 3.0 
+        Q1 = round(float(annual_tco2.quantile(0.25)), 4)
+        Q2 = round(float(annual_tco2.quantile(0.50)), 4)
+        Q3 = round(float(annual_tco2.quantile(0.75)), 4)
+    except Exception as e:
+        print(f"데이터 로드 실패: {e}")
 
-Q1, Q2, Q3 = initialize_kpi_thresholds()
+# 실행
+initialize_data()
 
-GRADE_THRESHOLDS = [
-    (Q1, "A"),   # 하위 25% 이하 → 우수
-    (Q2, "B"),   # 25~50% → 양호
-    (Q3, "C"),   # 50~75% → 보통
-]
-
-# 등급 기준표 (프론트 기준표 표시용)
+# 등급 테이블 설정 (이제 위에서 계산된 Q1, Q2, Q3를 참조함)
+GRADE_THRESHOLDS = [(Q1, "A"), (Q2, "B"), (Q3, "C")]
 GRADE_TABLE = [
     {"grade": "D", "range": f"{Q3}~", "min": Q3, "max": None},
     {"grade": "C", "range": f"{Q2}~{Q3}", "min": Q2, "max": Q3},
