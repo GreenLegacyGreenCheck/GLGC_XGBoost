@@ -9,12 +9,6 @@ GreenCheck - 탄소 배출 진단 종합 API 서버 (XGBoost/SHAP 담당 파트)
 - AI 분석 근거 자연어 문장
 - Before/After 시뮬레이션 (1도/2도/3도 감축 액션)
 
-[중요 - 공신력 명시]
-- 에너지 등급 구간(A:0~1.5, B:1.5~2.3, C:2.3~3, D:3~4 tCO2eq/년)은 팀 자체 설정값
-- 전국/동종업 평균은 공식 통계 부재로 자체 수집 데이터(서울 건물 1,505건) 대체
-- 냉방/가스 평균 비중 30%는 공식 통계 없는 자체 가정치
-- 3개월 추세 예측은 현재 변화율 유지 단순 가정
-
 [로컬 실행]
 uvicorn main:app --reload --port 8000
 """
@@ -23,6 +17,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Optional, Dict
 import pandas as pd
+import math
 
 app = FastAPI(title="GreenCheck XGBoost/ESG API")
 
