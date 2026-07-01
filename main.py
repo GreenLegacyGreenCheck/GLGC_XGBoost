@@ -41,20 +41,24 @@ df = pd.read_csv("real_energy_data.csv")
 AVG_ELEC_KWH = df["useQty_kwh"].mean()
 STD_ELEC_KWH = df["useQty_kwh"].std()
 
-# 에너지 등급 구간 (자체 설정, 공식 근거 없음)
+# 사분위수 기반 에너지 등급 구간 (자체 수집 데이터 기반, 공식 근거 없음)
+# tCO2eq/년 기준으로 환산 (월간 kWh → 연간 tCO2eq)
+Q1 = round(df["useQty_kwh"].quantile(0.25) * CO2_PER_KWH * 12, 3)
+Q2 = round(df["useQty_kwh"].quantile(0.50) * CO2_PER_KWH * 12, 3)
+Q3 = round(df["useQty_kwh"].quantile(0.75) * CO2_PER_KWH * 12, 3)
+
 GRADE_THRESHOLDS = [
-    (1.5, "A"),
-    (2.3, "B"),
-    (3.0, "C"),
-    (4.0, "D")
+    (Q1, "A"),   # 하위 25% 미만 → 우수
+    (Q2, "B"),   # 25~50% → 양호
+    (Q3, "C"),   # 50~75% → 보통
 ]
 
 # 등급 기준표 (프론트 기준표 표시용)
 GRADE_TABLE = [
-    {"grade": "D", "range": "3~4", "min": 3.0, "max": 4.0},
-    {"grade": "C", "range": "2.3~3", "min": 2.3, "max": 3.0},
-    {"grade": "B", "range": "1.5~2.3", "min": 1.5, "max": 2.3},
-    {"grade": "A", "range": "0~1.5", "min": 0.0, "max": 1.5}
+    {"grade": "D", "range": f"{Q3}~", "min": Q3, "max": None},
+    {"grade": "C", "range": f"{Q2}~{Q3}", "min": Q2, "max": Q3},
+    {"grade": "B", "range": f"{Q1}~{Q2}", "min": Q1, "max": Q2},
+    {"grade": "A", "range": f"0~{Q1}", "min": 0.0, "max": Q1}
 ]
 
 ESG_QUESTIONS = {
@@ -80,7 +84,7 @@ def calc_energy_grade(annual_tco2):
     for threshold, grade in GRADE_THRESHOLDS:
         if annual_tco2 <= threshold:
             return grade
-    return "E"
+    return "D"  # Q3 초과 → D
 
 
 def calc_emission(elec_kwh, gas_mj):
@@ -120,19 +124,19 @@ def compare_to_average(elec_kwh, annual_tco2, national_avg_tco2=None, industry_a
     diff_vs_industry = round((annual_tco2 - industry_avg) / industry_avg * 100, 1) if industry_avg else None
 
     # 진단 메시지 (규칙 기반)
-    if rank_percentile >= 70:
+   if rank_percentile <= 30:
         message = f"동종업 상위 {rank_percentile}%에 해당해요. 현재 수준을 잘 유지해보세요."
-    elif rank_percentile >= 40:
-        message = f"동종업 상위 {rank_percentile}%에 해당해요. 조금만 더 노력하면 상위권 진입이 가능해요."
+    elif rank_percentile <= 60:
+        message = f"동종업 상위 {rank_percentile}%에 해당해요. 조금 더 노력하면 상위권 진입이 가능해요."
     else:
         message = f"동종업 상위 {rank_percentile}%에 해당해요. 감축 액션이 필요해요."
 
     # 평균 대비 라벨
     if diff_vs_industry is not None:
         if diff_vs_industry < 0:
-            avg_label = f"전국 소상공인 평균 대비 {abs(diff_vs_industry)}% 낮음"
+            avg_label = f"서울 근린생활 시설 평균 대비 {abs(diff_vs_industry)}% 낮음"
         else:
-            avg_label = f"전국 소상공인 평균 대비 {diff_vs_industry}% 높음"
+            avg_label = f"서울 근린생활 시설 평균 대비 {diff_vs_industry}% 높음"
     else:
         avg_label = None
 
@@ -198,10 +202,6 @@ def analyze_cause(elec_kwh, gas_mj, device_usage, industry_avg_kwh=None):
                 "ratio_percent": gas_ratio,
                 "label": f"{round(gas_emission, 2)} tCO₂e ({gas_ratio}%)"
             }
-        },
-        "electricity_breakdown": {
-            "cooling_ratio_percent": cooling_ratio,
-            "lighting_etc_ratio_percent": lighting_etc_ratio
         },
         "comparison_metrics": {
             "elec_vs_avg_percent": elec_vs_avg,
