@@ -40,28 +40,19 @@ ASSUMED_AVG_GAS_RATIO = 30.0
 # ──────────────────────────────────────────────
 # 1. 실측 데이터 기반 동적 KPI 구간(사분위수) 계산
 # ──────────────────────────────────────────────
-try:
-    df = pd.read_csv("real_energy_data.csv")
-    AVG_ELEC_KWH = float(df["useQty_kwh"].mean())
-    STD_ELEC_KWH = float(df["useQty_kwh"].std())
-    
-    # 건물 고유 ID 기준으로 그룹화하여 월 평균을 내고 연간으로 환산 -> 정밀도 향상
-    if 'sigunguCd' in df.columns and 'bjdongCd' in df.columns and 'bun' in df.columns:
-        monthly_avg_kwh = df.groupby(['sigunguCd', 'bjdongCd', 'bun'])['useQty_kwh'].mean()
-    else:
-        monthly_avg_kwh = df["useQty_kwh"]
-        
-    annual_tco2_series = (monthly_avg_kwh * 12) * CO2_PER_KWH
-    
-    # 4자리 보존하여 등급 구간 산출
-    Q1 = round(float(annual_tco2_series.quantile(0.25)), 4)
-    Q2 = round(float(annual_tco2_series.quantile(0.50)), 4)
-    Q3 = round(float(annual_tco2_series.quantile(0.75)), 4)
-except Exception as e:
-    print(f"⚠️ 데이터 로드 실패. 기본 설정값 사용. ({e})")
-    AVG_ELEC_KWH = 0.0
-    STD_ELEC_KWH = 1.0
-    Q1, Q2, Q3 = 1.5, 2.3, 3.0
+def initialize_kpi_thresholds():
+    try:
+        df = pd.read_csv("real_energy_data.csv")
+        # 건물별 그룹화 후 연간 환산
+        annual_tco2 = (df.groupby(['sigunguCd', 'bjdongCd', 'bun'])['useQty_kwh'].mean() * 12) * CO2_PER_KWH
+        q1 = float(annual_tco2.quantile(0.25))
+        q2 = float(annual_tco2.quantile(0.50))
+        q3 = float(annual_tco2.quantile(0.75))
+        return q1, q2, q3
+    except:
+        return 1.5, 2.3, 3.0 
+
+Q1, Q2, Q3 = initialize_kpi_thresholds()
 
 GRADE_THRESHOLDS = [
     (Q1, "A"),   # 하위 25% 이하 → 우수
@@ -104,11 +95,15 @@ def calc_energy_grade(annual_tco2):
 
 
 def calc_emission(elec_kwh, gas_mj):
-    # 가스 사용량 None 방어 및 조기 반올림으로 인한 0 반환 유실 방지(4자리 유지)
-    elec_emission = elec_kwh * CO2_PER_KWH
-    gas_emission = float(gas_mj or 0.0) * CO2_PER_MJ
+    elec_val = float(elec_kwh)
+    gas_val = float(gas_mj) if gas_mj is not None else 0.0
+
+    elec_emission = elec_val * CO2_PER_KWH
+    gas_emission = gas_val * CO2_PER_MJ
+    
     monthly_total = elec_emission + gas_emission
     annual_total = monthly_total * 12
+    
     return round(elec_emission, 4), round(gas_emission, 4), round(monthly_total, 4), round(annual_total, 4)
 
 
@@ -259,30 +254,24 @@ def compare_to_previous_month(elec_kwh, gas_mj, prev_elec_kwh=None, prev_gas_mj=
 # ──────────────────────────────────────────────
 # 6. 추세 예측 (예측 배출량 기반 새로운 등급 갱신)
 # ──────────────────────────────────────────────
-def predict_trend(annual_tco2, current_grade, monthly_change_percent=None):
-    if monthly_change_percent is None:
-        monthly_change_percent = 0
-
-    rate = monthly_change_percent / 100
+def predict_trend(annual_tco2, monthly_change_percent=None):
+    rate = (monthly_change_percent or 0) / 100
+    # 3개월 후 배출량 예측
     predicted_tco2 = round(annual_tco2 * ((1 + rate) ** 3), 4)
-    if predicted_tco2 < 0: 
-        predicted_tco2 = 0.0
-        
-    # 변화된 배출량에 맞춰 등급 새로 판정!
+    if predicted_tco2 < 0: predicted_tco2 = 0.0
+    
+    
+    current_grade = calc_energy_grade(annual_tco2)
     predicted_grade = calc_energy_grade(predicted_tco2)
-
+    
     return {
-        "assumption": "현재 변화율이 3개월간 동일하게 유지된다고 가정한 단순 추정치",
         "keep_current": {
             "predicted_annual_tco2": predicted_tco2,
-            "current_grade": current_grade,        
-            "predicted_grade": predicted_grade,    # 정상 갱신된 새로운 등급
-            "grade_change": f"{current_grade} → {predicted_grade}", 
-            "grade_changed": current_grade != predicted_grade         
-        },
-        "grade_table": GRADE_TABLE
+            "current_grade": current_grade,
+            "predicted_grade": predicted_grade,
+            "grade_changed": current_grade != predicted_grade 
     }
-
+    }
 
 # ──────────────────────────────────────────────
 # 8. 절감 목표 및 진행률
