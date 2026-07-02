@@ -84,27 +84,45 @@ def calc_reduction_goal(annual_tco2):
     remaining = max(0, annual_tco2 - target_tco2)
     return {"current_grade": curr_g, "target_grade": ["A","B","C","D"][target_idx], "remaining_reduction_tco2": remaining}
 
+# logic.py 내 calc_cost_saving 함수 수정
+
 def calc_cost_saving(elec_kwh, gas_mj, goal_data, elec_ratio, gas_ratio):
     remaining = goal_data["remaining_reduction_tco2"]
     current_cost = round((elec_kwh * models.ELEC_PRICE_PER_KWH + float(gas_mj or 0) * models.GAS_PRICE_PER_MJ) * 12)
     
-    if remaining <= 0: return {"current_annual_cost_krw": current_cost, "expected_saving_krw": 0, "annual_saving_label": "목표 달성"}
+    if remaining <= 0: 
+        return {"current_annual_cost_krw": current_cost, "expected_saving_krw": 0, "annual_saving_label": "목표 달성"}
     
-    saving = (remaining / 12 / models.CO2_PER_KWH * models.ELEC_PRICE_PER_KWH * 12) # 단순화된 계산식
-    return {"current_annual_cost_krw": current_cost, "expected_saving_krw": round(saving), "annual_saving_label": f"연간 약 {round(saving/10000)}만원 절감"}
-
+    # 전기와 가스의 배출 비율에 따라 감축 목표량(tCO2) 분배
+    elec_reduction_tco2 = remaining * (elec_ratio / 100)
+    gas_reduction_tco2 = remaining * (gas_ratio / 100)
+    
+    # 각각의 배출 계수로 에너지량을 역산한 뒤 요금 적용
+    elec_saving = (elec_reduction_tco2 / models.CO2_PER_KWH) * models.ELEC_PRICE_PER_KWH
+    gas_saving = (gas_reduction_tco2 / models.CO2_PER_MJ) * models.GAS_PRICE_PER_MJ
+    
+    total_saving = round(elec_saving + gas_saving)
+    
+    return {
+        "current_annual_cost_krw": current_cost, 
+        "expected_saving_krw": total_saving, 
+        "annual_saving_label": f"연간 약 {round(total_saving/10000)}만원 절감"
+    }
 def calc_esg_score(elec_kwh, gas_mj, answers):
     # (기존 calc_esg_score 로직 그대로 이식)
     return {"status_label": "양호"} # 예시 반환값
+
+# logic.py 내 diagnose 함수 상단 수정
 
 def diagnose(elec_kwh, gas_mj=None, device_usage=None, national_avg_tco2=None, industry_avg_tco2=None, 
              industry_avg_kwh=None, esg_answers=None, prev_elec_kwh=None, prev_gas_mj=None):
     
     _, _, _, annual_total = utils.calc_emission(elec_kwh, gas_mj)
     
-    # 전월 대비 계산
-    if prev_elec_kwh:
-        _, _, _, prev_total = utils.calc_emission(prev_elec_kwh, prev_gas_mj)
+    # 수정됨: 둘 중 하나라도 입력값이 존재하면(0 포함) 전월 대비 증감률을 계산하도록 조건식 변경
+    if prev_elec_kwh is not None or prev_gas_mj is not None:
+        # 값이 없을 경우 0.0으로 기본값 처리
+        _, _, _, prev_total = utils.calc_emission(prev_elec_kwh or 0.0, prev_gas_mj or 0.0)
         change_rate = (annual_total - prev_total) / prev_total * 100 if prev_total > 0 else 0
     else:
         change_rate = 0
